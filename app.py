@@ -151,6 +151,42 @@ def carica(percorso: str) -> pd.DataFrame:
     return ingestion.carica_archivio(percorso)
 
 
+def _parse_riga(line: str):
+    """Trasforma una riga di archivio (AAAAMMGG RUOTA:n.n.n.n.n ...) in righe df."""
+    parts = line.strip().split(" ")
+    d = parts[0]
+    data = pd.Timestamp(_dt.date(int(d[:4]), int(d[4:6]), int(d[6:8])))
+    out = []
+    for blk in parts[1:]:
+        ruota, nums = blk.split(":")
+        nn = [int(x) for x in nums.split(".")]
+        if len(nn) == 5 and all(1 <= x <= 90 for x in nn):
+            out.append((data, ruota, *nn))
+    return out
+
+
+def costruisci_df(percorso: str, extra: list) -> pd.DataFrame:
+    """Archivio di base (dal repo) + estrazioni extra salvate nel browser."""
+    df = carica(percorso)
+    righe = []
+    for line in extra or []:
+        try:
+            righe += _parse_riga(line)
+        except Exception:
+            pass
+    if not righe:
+        return df
+    edf = pd.DataFrame(righe, columns=["data", "ruota", "n1", "n2", "n3", "n4", "n5"])
+    for c in ["n1", "n2", "n3", "n4", "n5"]:
+        edf[c] = edf[c].astype("int16")
+    edf["numeri"] = edf[["n1", "n2", "n3", "n4", "n5"]].apply(
+        lambda r: frozenset(int(x) for x in r), axis=1)
+    both = pd.concat([df, edf], ignore_index=True)
+    both = both.drop_duplicates(subset=["data", "ruota"], keep="last")
+    both = both.sort_values(["data", "ruota"], kind="stable").reset_index(drop=True)
+    return both
+
+
 @st.cache_data(show_spinner=True)
 def frequenze_per_ruota(percorso: str) -> pd.DataFrame:
     df = carica(percorso)
@@ -289,37 +325,76 @@ st.markdown("<div class='hero'>🎱 SmartLotto</div>"
             unsafe_allow_html=True)
 
 percorso = st.sidebar.text_input("Archivio estrazioni", PERCORSO_DEFAULT)
-st.sidebar.subheader("Aggiornamento")
-if st.sidebar.button("⬇️ Scarica estrazioni mancanti"):
-    with st.spinner("Scarico le estrazioni nuove..."):
-        try:
-            n = aggiornamento.aggiorna_archivio(percorso)
-            carica.clear()
-            try:
-                verifica_previsioni(carica(percorso))
-            except Exception:
-                pass
-            st.sidebar.success(f"{n} nuove estrazioni aggiunte." if n else "Archivio già aggiornato.")
-        except Exception as e:
-            st.sidebar.error(f"Aggiornamento non riuscito: {e}")
-ult = aggiornamento.ultima_data_archivio(percorso)
-if ult:
-    st.sidebar.caption(f"Ultima estrazione: {ult.strftime('%d/%m/%Y')}")
-st.sidebar.caption("💾 I tuoi dati (numeri, osservati, previsioni) restano salvati "
-                   "nel browser di questo telefono, anche dopo gli aggiornamenti.")
 
-if "auto_agg" not in st.session_state:
-    try:
-        aggiornamento.aggiorna_archivio(percorso)
-    except Exception:
-        pass
-    st.session_state["auto_agg"] = True
-
+# Archivio di base (dal repo) + estrazioni extra salvate nel browser del telefono.
+extra = ls_load("sl_estr_extra", [])
 try:
-    df = carica(percorso)
+    df = costruisci_df(percorso, extra)
 except Exception as e:
     st.error(f"Impossibile caricare l'archivio: {e}")
     st.stop()
+
+
+def _applica_nuove(nuove):
+    """Salva le righe nuove nel browser (così restano) e ricostruisce l'archivio."""
+    global df, extra
+    extra = list(dict.fromkeys((extra or []) + list(nuove)))
+    ls_save("sl_estr_extra", extra, "estr_save")
+    df = costruisci_df(percorso, extra)
+
+
+# --- AGENTE: aggiornamento automatico all'apertura (una volta per sessione) ---
+if "auto_agg" not in st.session_state:
+    st.session_state["auto_agg"] = True
+    try:
+        nuove = aggiornamento.scarica_nuove(df["data"].max().date())
+        if nuove:
+            _applica_nuove(nuove)
+            st.session_state["agg_msg"] = ("ok", f"🔄 Scaricate {len(nuove)} nuove estrazioni.")
+        else:
+            st.session_state["agg_msg"] = ("ok", "✅ Archivio già aggiornato.")
+    except Exception as e:
+        st.session_state["agg_msg"] = ("warn",
+            f"⚠️ Aggiornamento automatico non riuscito ({type(e).__name__}). "
+            "Inseriscila a mano qui sotto.")
+
+st.sidebar.subheader("🤖 Agente estrazioni")
+msg = st.session_state.get("agg_msg")
+if msg:
+    (st.sidebar.info if msg[0] == "ok" else st.sidebar.warning)(msg[1])
+st.sidebar.caption(f"Ultima estrazione in archivio: {df['data'].max().date().strftime('%d/%m/%Y')}")
+if st.sidebar.button("🔄 Aggiorna ora"):
+    with st.spinner("Scarico le estrazioni nuove..."):
+        try:
+            nuove = aggiornamento.scarica_nuove(df["data"].max().date())
+            if nuove:
+                _applica_nuove(nuove)
+                st.sidebar.success(f"Scaricate {len(nuove)} nuove estrazioni.")
+            else:
+                st.sidebar.info("Archivio già aggiornato.")
+        except Exception as e:
+            st.sidebar.warning(f"Non riuscito ({type(e).__name__}). Inseriscila a mano qui sotto.")
+
+with st.sidebar.expander("➕ Inserisci estrazione a mano"):
+    st.caption("Serve solo se l'agente automatico non riesce a scaricare.")
+    md = st.date_input("Data", df["data"].max().date(), key="man_data", format="DD/MM/YYYY")
+    mr = st.selectbox("Ruota", RUOTE, format_func=lambda r: RUOTE_NOMI[r], key="man_ruota")
+    mn = st.text_input("5 numeri (separati da spazio)", key="man_num", placeholder="es. 12 34 56 78 90")
+    if st.button("Salva estrazione", key="man_save"):
+        try:
+            nn = [int(x) for x in mn.split()]
+        except ValueError:
+            nn = []
+        if len(nn) == 5 and all(1 <= x <= 90 for x in nn):
+            riga = f"{md.year:04d}{md.month:02d}{md.day:02d} {mr}:" + ".".join(f"{x:02d}" for x in nn)
+            _applica_nuove([riga])
+            st.success(f"Aggiunta {RUOTE_NOMI[mr]} del {md.strftime('%d/%m/%Y')}.")
+            st.rerun()
+        else:
+            st.warning("Servono esattamente 5 numeri fra 1 e 90.")
+
+st.sidebar.caption("💾 I tuoi dati e le estrazioni scaricate restano nel browser di "
+                   "questo telefono, anche dopo gli aggiornamenti.")
 
 # Verifica automatica delle previsioni in sospeso a ogni apertura.
 try:
