@@ -99,6 +99,23 @@ def _riga_archivio(data: _dt.date, ruote: dict[str, list[int]]) -> str:
     return key + " " + " ".join(blocchi)
 
 
+def scarica_nuove(ultima: _dt.date | None, fino_a: _dt.date | None = None,
+                  timeout: int = 15) -> list[str]:
+    """Scarica le estrazioni successive a `ultima` e le ritorna come righe di
+    archivio (senza scrivere su file). Usata online: le righe verranno salvate
+    nel browser dell'utente così sopravvivono ai riavvii di Streamlit.
+    """
+    if fino_a is None:
+        fino_a = _dt.date.today()
+    dal = (ultima + _dt.timedelta(days=1)) if ultima else _dt.date(1871, 1, 1)
+    if dal > fino_a:
+        return []
+    html = _scarica_html(dal, fino_a, timeout=timeout)
+    per_data = analizza_html(html)
+    nuove = sorted(d for d in per_data if (ultima is None or d > ultima))
+    return [_riga_archivio(d, per_data[d]) for d in nuove]
+
+
 def aggiorna_archivio(percorso: str, fino_a: _dt.date | None = None) -> int:
     """Scarica le estrazioni successive all'ultima presente e le aggiunge.
 
