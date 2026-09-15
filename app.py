@@ -318,6 +318,67 @@ def selezione_regole(prefix: str) -> list:
     return scelte
 
 
+# ============================ SCHEDINA — calcolo vincite ============================
+MOLTIPLICATORI = {"estratto": 11.23, "ambo": 250, "terno": 4500,
+                  "quaterna": 120000, "cinquina": 6000000}
+SORTE_SIZE = {"estratto": 1, "ambo": 2, "terno": 3, "quaterna": 4, "cinquina": 5}
+
+
+def carica_schedine():
+    return ls_load("sl_schedine", [])
+
+
+def salva_schedine(voci, wkey="sched_save"):
+    ls_save("sl_schedine", voci, wkey)
+
+
+def vincita_giocata(numeri, punti, n_usciti):
+    """Vincita reale: (puntata ÷ combinazioni) × moltiplicatore × combinazioni uscite."""
+    K = len(numeri)
+    out = {}
+    for sorte, imp in punti.items():
+        imp = float(imp or 0)
+        if imp <= 0:
+            continue
+        t = SORTE_SIZE[sorte]
+        ctot = comb(K, t)
+        if ctot == 0:
+            continue
+        cvinc = comb(n_usciti, t) if n_usciti >= t else 0
+        out[sorte] = (imp / ctot) * MOLTIPLICATORI[sorte] * cvinc
+    return out, sum(out.values())
+
+
+def tabella_vincite(numeri, punti):
+    """Scenari: quanto vinci a seconda di quanti tuoi numeri escono (max 5 per ruota)."""
+    K = len(numeri)
+    attive = [s for s in SORTE_SIZE if float(punti.get(s, 0) or 0) > 0]
+    minsize = min((SORTE_SIZE[s] for s in attive), default=1)
+    righe = []
+    for M in range(max(minsize, 1), min(K, 5) + 1):
+        det, tot = vincita_giocata(numeri, punti, M)
+        r = {"Numeri usciti": f"{M} su {K}"}
+        for s in ["estratto", "ambo", "terno", "quaterna", "cinquina"]:
+            if s in attive:
+                r[s.capitalize()] = f"{det.get(s, 0):.2f} €"
+        r["Vincita"] = f"{tot:.2f} €"
+        righe.append(r)
+    return pd.DataFrame(righe)
+
+
+def monitora_giocata(df, ruota_code, numeri, da_data):
+    """Scorre le estrazioni della ruota dalla data di creazione e trova le uscite."""
+    numeri = set(numeri)
+    sub = ingestion.matrice_ruota(df, ruota_code)
+    sub = sub[sub["data"].dt.date >= da_data].sort_values("data")
+    esiti = []
+    for i, (_, row) in enumerate(sub.iterrows()):
+        usciti = sorted(numeri & row["numeri"])
+        if usciti:
+            esiti.append({"data": row["data"].date(), "dopo": i + 1, "usciti": usciti})
+    return len(sub), esiti
+
+
 # ============================ intestazione + sidebar ============================
 
 st.markdown("<div class='hero'>🎱 SmartLotto</div>"
@@ -358,25 +419,135 @@ if "auto_agg" not in st.session_state:
             f"⚠️ Aggiornamento automatico non riuscito ({type(e).__name__}). "
             "Inseriscila a mano qui sotto.")
 
-st.sidebar.subheader("🤖 Agente estrazioni")
-msg = st.session_state.get("agg_msg")
-if msg:
-    (st.sidebar.info if msg[0] == "ok" else st.sidebar.warning)(msg[1])
-st.sidebar.caption(f"Ultima estrazione in archivio: {df['data'].max().date().strftime('%d/%m/%Y')}")
-if st.sidebar.button("🔄 Aggiorna ora"):
-    with st.spinner("Scarico le estrazioni nuove..."):
-        try:
-            nuove = aggiornamento.scarica_nuove(df["data"].max().date())
-            if nuove:
-                _applica_nuove(nuove)
-                st.sidebar.success(f"Scaricate {len(nuove)} nuove estrazioni.")
-            else:
-                st.sidebar.info("Archivio già aggiornato.")
-        except Exception as e:
-            st.sidebar.warning(f"Non riuscito ({type(e).__name__}). Inseriscila a mano qui sotto.")
+# Banner dell'agente, ben visibile in cima (i comandi sono nella scheda 🤖 Agente)
+_m = st.session_state.get("agg_msg")
+if _m:
+    (st.info if _m[0] == "ok" else st.warning)(_m[1] + "  ·  Comandi nella scheda 🤖 Agente.")
+st.sidebar.caption("💾 I tuoi dati (numeri, osservati, schedine, estrazioni) restano nel "
+                   "browser di questo telefono, anche dopo gli aggiornamenti.")
 
-with st.sidebar.expander("➕ Inserisci estrazione a mano"):
-    st.caption("Serve solo se l'agente automatico non riesce a scaricare.")
+# Verifica automatica delle previsioni in sospeso a ogni apertura.
+try:
+    verifica_previsioni(df)
+except Exception:
+    pass
+
+
+tab_sched, tab_prev, tab_oss, tab_num, tab_agente, tab_guida, tab_cielo, tab_form = st.tabs(
+    ["🎟️ Schedina", "🎯 Previsione", "👁️ Osservati", "📊 Numeri", "🤖 Agente",
+     "📖 Guida", "🌙 Cielo", "🔬 Formule"])
+
+
+# ============================ TAB SCHEDINA ============================
+with tab_sched:
+    st.subheader("🎟️ La mia schedina")
+    st.caption("Fino a 4 giocate. Per ognuna: ruota, numeri (da 1 a 10) e quanto punti "
+               "per sorte. L'app la monitora e calcola la vincita, che tu l'abbia giocata o no.")
+
+    n_gioc = st.number_input("Quante giocate", 1, 4, 1, key="sc_n")
+    giocate = []
+    for i in range(int(n_gioc)):
+        with st.container(border=True):
+            st.markdown(f"**Giocata {i+1}**")
+            rr = st.selectbox("Ruota", RUOTE, format_func=lambda r: RUOTE_NOMI[r], key=f"sc_ruota_{i}")
+            tn = st.text_input("Numeri (da 1 a 10, separati da spazio)", key=f"sc_num_{i}",
+                               placeholder="es. 5 17 23 44 67 82")
+            cols = st.columns(5)
+            punti = {}
+            for col, s in zip(cols, ["estratto", "ambo", "terno", "quaterna", "cinquina"]):
+                punti[s] = col.number_input(s.capitalize() + " €", 0.0, 200.0, 0.0, 0.5, key=f"sc_{s}_{i}")
+            try:
+                nums = sorted({int(x) for x in tn.split() if 1 <= int(x) <= 90})[:10]
+            except ValueError:
+                nums = []
+            giocate.append({"ruota": rr, "numeri": nums, "punti": punti})
+            if nums and any(float(v or 0) > 0 for v in punti.values()):
+                st.caption(f"Numeri: {' '.join(f'{n:02d}' for n in nums)} — possibili vincite:")
+                st.dataframe(tabella_vincite(nums, punti), hide_index=True, use_container_width=True)
+
+    reale = st.toggle("L'ho giocata davvero?", key="sc_reale")
+    tot_punt = sum(float(v or 0) for g in giocate for v in g["punti"].values())
+    st.markdown(f"**Totale puntato: € {tot_punt:.2f}**")
+    if st.button("💾 Salva schedina e monitora", type="primary", use_container_width=True):
+        valide = [g for g in giocate if g["numeri"] and any(float(v or 0) > 0 for v in g["punti"].values())]
+        if not valide:
+            st.warning("Inserisci almeno una giocata con numeri e una puntata.")
+        else:
+            voci = carica_schedine()
+            voci.append({"id": _dt.datetime.now().strftime("%Y%m%d%H%M%S%f"),
+                         "creata": _dt.date.today().isoformat(),
+                         "reale": bool(reale), "giocate": valide})
+            salva_schedine(voci, "sched_add")
+            st.success("Schedina salvata e messa in monitoraggio.")
+            st.rerun()
+
+    st.markdown("---")
+    st.subheader("Le mie schedine")
+    voci = carica_schedine()
+    if not voci:
+        st.info("Nessuna schedina salvata. Compila qui sopra e premi «Salva».")
+    for v in reversed(voci):
+        creata = _dt.date.fromisoformat(v["creata"])
+        with st.container(border=True):
+            tag = "🟢 giocata davvero" if v.get("reale") else "👁️ solo monitorata"
+            st.markdown(f"**Schedina del {creata.strftime('%d/%m/%Y')}** · {tag}")
+            vinc_tot = 0.0
+            for g in v["giocate"]:
+                nums, ruota = g["numeri"], g["ruota"]
+                ncontr, esiti = monitora_giocata(df, ruota, nums, creata)
+                usciti_tot = sorted({n for e in esiti for n in e["usciti"]})
+                st.markdown(f"<span class='ruota-lbl'>{RUOTE_NOMI[ruota]}</span> "
+                            f"{chip_html(nums, usciti_tot, big=True)}", unsafe_allow_html=True)
+                best_M = max((len(e["usciti"]) for e in esiti), default=0)
+                if best_M >= 2:
+                    _, tot = vincita_giocata(nums, g["punti"], best_M)
+                    vinc_tot += tot
+                    ez = next(e for e in esiti if len(e["usciti"]) == best_M)
+                    st.markdown(f"<span style='color:#4CBF8B'>🎉 {best_M} numeri usciti il "
+                                f"{ez['data'].strftime('%d/%m/%Y')} → vincita {tot:.2f} €</span>",
+                                unsafe_allow_html=True)
+                else:
+                    st.caption(f"In monitoraggio · {ncontr} estrazioni controllate · nessuna sorte completa")
+            if vinc_tot > 0:
+                st.markdown(f"### Vincita totale: {vinc_tot:.2f} €")
+                st.caption("Importo lordo (prima della tassa dello Stato)." +
+                           ("" if v.get("reale") else " Non l'hai giocata: è quanto avresti vinto."))
+            cbtn = st.columns(2)
+            if cbtn[0].button("🔁 Giocata sì/no", key="tg_" + v["id"]):
+                voci2 = carica_schedine()
+                for x in voci2:
+                    if x["id"] == v["id"]:
+                        x["reale"] = not x.get("reale")
+                salva_schedine(voci2, "sched_tg")
+                st.rerun()
+            if cbtn[1].button("🗑️ Rimuovi", key="rm_" + v["id"]):
+                salva_schedine([x for x in carica_schedine() if x["id"] != v["id"]], "sched_rm")
+                st.rerun()
+
+
+# ============================ TAB AGENTE ============================
+with tab_agente:
+    st.subheader("🤖 Agente estrazioni")
+    st.caption("Scarica da solo le estrazioni nuove all'apertura e le salva nel telefono.")
+    _mm = st.session_state.get("agg_msg")
+    if _mm:
+        (st.info if _mm[0] == "ok" else st.warning)(_mm[1])
+    st.markdown(f"**Ultima estrazione in archivio:** {df['data'].max().date().strftime('%d/%m/%Y')}")
+    if st.button("🔄 Aggiorna ora", key="ag_now", use_container_width=True):
+        with st.spinner("Scarico le estrazioni nuove..."):
+            try:
+                nuove = aggiornamento.scarica_nuove(df["data"].max().date())
+                if nuove:
+                    _applica_nuove(nuove)
+                    st.success(f"Scaricate {len(nuove)} nuove estrazioni.")
+                    st.rerun()
+                else:
+                    st.info("Archivio già aggiornato.")
+            except Exception as e:
+                st.warning(f"Non riuscito ({type(e).__name__}). Usa l'inserimento manuale qui sotto.")
+
+    st.markdown("---")
+    st.markdown("**➕ Inserisci un'estrazione a mano** (solo se l'automatico non riesce)")
     md = st.date_input("Data", df["data"].max().date(), key="man_data", format="DD/MM/YYYY")
     mr = st.selectbox("Ruota", RUOTE, format_func=lambda r: RUOTE_NOMI[r], key="man_ruota")
     mn = st.text_input("5 numeri (separati da spazio)", key="man_num", placeholder="es. 12 34 56 78 90")
@@ -392,19 +563,7 @@ with st.sidebar.expander("➕ Inserisci estrazione a mano"):
             st.rerun()
         else:
             st.warning("Servono esattamente 5 numeri fra 1 e 90.")
-
-st.sidebar.caption("💾 I tuoi dati e le estrazioni scaricate restano nel browser di "
-                   "questo telefono, anche dopo gli aggiornamenti.")
-
-# Verifica automatica delle previsioni in sospeso a ogni apertura.
-try:
-    verifica_previsioni(df)
-except Exception:
-    pass
-
-
-tab_prev, tab_oss, tab_num, tab_guida, tab_cielo, tab_form = st.tabs(
-    ["🎯 Previsione", "👁️ Osservati", "📊 Numeri", "📖 Guida", "🌙 Cielo", "🔬 Formule"])
+    st.caption("💾 Le estrazioni scaricate o inserite restano nel browser di questo telefono.")
 
 
 # ============================ TAB PREVISIONE ============================
