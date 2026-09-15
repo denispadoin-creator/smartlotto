@@ -2,48 +2,41 @@
 """
 Interfaccia Streamlit di SmartLotto — versione per cellulare.
 
-Avvio:
-    streamlit run app.py
-
-Schermate: Previsione (con scelta delle regole e probabilità delle sorti),
-Osservati (misura delle previsioni nel tempo), Numeri (ritardi/frequenze +
-i miei numeri + regole affini), Guida (come leggere le percentuali), Cielo,
-Formule (backtesting e validazione sul futuro, in parole semplici).
+PERSISTENZA: i dati dell'utente (i miei numeri, gli osservati, le previsioni,
+le schedine) sono salvati nel LOCAL STORAGE del browser del telefono. Così
+restano anche quando l'app si ricarica o viene aggiornata online (stesso
+indirizzo = stessa memoria). Su Streamlit Cloud il disco del server viene
+azzerato a ogni riavvio: per questo NON si usa più un file su disco.
 """
 
 from __future__ import annotations
 import datetime as dt
 import datetime as _dt
 import json
-import os
 from math import comb
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+from streamlit_local_storage import LocalStorage
 
 from smartlotto import ingestion, statistiche, sequenze, numerologia, astro, predittore, tracker
 from smartlotto import aggiornamento, regole, backtest as B, formule, RUOTE, RUOTE_NOMI
 from smartlotto.backtest import P_ESTRATTO
 from smartlotto.strategie import StatoIncrementale
 
-PERCORSO_PREV = "previsioni.json"
-PERCORSO_OSS = "osservati.json"
 PERCORSO_DEFAULT = "data/archivio_lotto.txt"
 
 st.set_page_config(page_title="SmartLotto", layout="wide", page_icon="🎱")
 
-# --- Stile: header compatto, tab grandi e leggibili sul telefono ---
 st.markdown("""
 <style>
 .block-container{padding-top:1.1rem;padding-bottom:2rem}
 .hero{font-size:1.45rem;font-weight:700;margin:0;line-height:1.2}
 .hero-sub{color:#AAB6C4;font-size:.9rem;margin:.25rem 0 .2rem}
-/* Tab piu grandi, con etichette ben visibili */
 button[data-baseweb="tab"]{padding:10px 16px !important}
 button[data-baseweb="tab"] p{font-size:1.02rem !important;font-weight:600 !important}
 div[data-baseweb="tab-list"]{gap:4px;overflow-x:auto}
-/* Chip numeri */
 .chip{display:inline-block;min-width:38px;text-align:center;padding:7px 9px;margin:3px;
   border-radius:9px;font-weight:700;font-variant-numeric:tabular-nums;font-size:1rem;
   background:rgba(120,120,120,.15);border:1px solid rgba(120,120,120,.30)}
@@ -54,7 +47,104 @@ div[data-baseweb="tab-list"]{gap:4px;overflow-x:auto}
 """, unsafe_allow_html=True)
 
 
-# ============================ funzioni di supporto ============================
+# ============================ PERSISTENZA (browser localStorage) ============================
+try:
+    LS = LocalStorage()
+except Exception:
+    LS = None
+
+
+def ls_load(chiave, default):
+    """Legge un valore salvato nel browser. Se manca, ritorna default."""
+    try:
+        raw = LS.getItem(chiave) if LS else None
+        if raw in (None, ""):
+            return default
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return default
+
+
+def ls_save(chiave, valore, wkey):
+    """Salva un valore nel browser (wkey = identificativo unico del punto di salvataggio)."""
+    try:
+        if LS:
+            LS.setItem(chiave, json.dumps(valore, ensure_ascii=False), key=wkey)
+    except Exception:
+        pass
+
+
+# ---- Osservati ----
+def carica_osservati():
+    return ls_load("sl_osservati", [])
+
+
+def salva_osservati(voci, wkey="oss_save"):
+    ls_save("sl_osservati", voci, wkey)
+
+
+# ---- Previsioni (registro + verifica, senza file su disco) ----
+def carica_previsioni():
+    return ls_load("sl_previsioni", [])
+
+
+def salva_previsioni(voci, wkey="prev_save"):
+    ls_save("sl_previsioni", voci, wkey)
+
+
+def registra_previsione(data_estrazione, ruote, wkey="prev_reg"):
+    voci = [v for v in carica_previsioni() if v["data_estrazione"] != data_estrazione.isoformat()]
+    voci.append({
+        "data_estrazione": data_estrazione.isoformat(),
+        "generata_il": _dt.datetime.now().isoformat(timespec="seconds"),
+        "ruote": {r: sorted(int(n) for n in nums) for r, nums in ruote.items()},
+        "verificata": False, "esiti": {},
+    })
+    voci.sort(key=lambda v: v["data_estrazione"])
+    salva_previsioni(voci, wkey)
+
+
+def verifica_previsioni(df):
+    """Confronta le previsioni non ancora verificate con l'archivio aggiornato."""
+    voci = carica_previsioni()
+    cambiato = False
+    for voce in voci:
+        if voce.get("verificata"):
+            continue
+        giorno = df[df["data"].dt.date == _dt.date.fromisoformat(voce["data_estrazione"])]
+        if giorno.empty:
+            continue
+        estr_per_ruota = {RUOTE_NOMI[r["ruota"]]: r["numeri"] for _, r in giorno.iterrows()}
+        esiti, trovata = {}, False
+        for ruota, previsti in voce["ruote"].items():
+            estr = estr_per_ruota.get(ruota)
+            if estr is None:
+                continue
+            trovata = True
+            azz = sorted(n for n in previsti if n in estr)
+            esiti[ruota] = {"previsti": sorted(previsti),
+                            "estratti": sorted(int(x) for x in estr),
+                            "azzeccati": azz, "n_azzeccati": len(azz)}
+        if trovata:
+            voce["esiti"] = esiti
+            voce["verificata"] = True
+            cambiato = True
+    if cambiato:
+        salva_previsioni(voci, "prev_verify")
+    return voci
+
+
+def ultima_verificata():
+    v = [x for x in carica_previsioni() if x.get("verificata")]
+    return v[-1] if v else None
+
+
+def ultima_in_attesa():
+    v = [x for x in carica_previsioni() if not x.get("verificata")]
+    return v[-1] if v else None
+
+
+# ============================ funzioni di calcolo ============================
 
 @st.cache_data(show_spinner=True)
 def carica(percorso: str) -> pd.DataFrame:
@@ -97,7 +187,6 @@ def esegui_formule(percorso: str, taglio: str) -> dict:
 
 
 def prob_sorte(k: int, s: int) -> float:
-    """Probabilità di fare la sorte s (almeno) giocando k numeri su una ruota."""
     tot = comb(90, 5)
     fav = sum(comb(k, i) * comb(90 - k, 5 - i) for i in range(s, min(k, 5) + 1))
     return fav / tot
@@ -107,13 +196,13 @@ SORTI = [("Estratto", 1), ("Ambo", 2), ("Terno", 3), ("Quaterna", 4), ("Cinquina
 
 
 def tabella_sorti(quanti: int) -> pd.DataFrame:
-    """Tabella probabilità estratto/ambo/.../cinquina giocando `quanti` numeri."""
     righe = []
     for nome, s in SORTI:
         if s > quanti:
             continue
         p = prob_sorte(quanti, s)
-        righe.append({"Sorte (almeno)": nome, "Probabilità": f"{p*100:.4f}%".rstrip("0").rstrip("."),
+        righe.append({"Sorte (almeno)": nome,
+                      "Probabilità": f"{p*100:.4f}%".rstrip("0").rstrip("."),
                       "1 su…": f"{round(1/p):,}".replace(",", ".")})
     return pd.DataFrame(righe)
 
@@ -121,11 +210,8 @@ def tabella_sorti(quanti: int) -> pd.DataFrame:
 def chip_html(numeri, azzeccati=None, big=False):
     azz = set(azzeccati or [])
     cls_extra = " big" if big else ""
-    out = []
-    for n in numeri:
-        cls = "chip ok" if n in azz else "chip" + cls_extra
-        out.append(f"<span class='{cls}'>{int(n):02d}</span>")
-    return "".join(out)
+    return "".join(f"<span class='{'chip ok' if n in azz else 'chip'+cls_extra}'>{int(n):02d}</span>"
+                   for n in numeri)
 
 
 def _stato_ruota(sub) -> StatoIncrementale:
@@ -136,8 +222,6 @@ def _stato_ruota(sub) -> StatoIncrementale:
 
 
 def affinita_regole(df, ruota_code, miei, data, top=8):
-    """Quali regole 'propongono' i miei numeri, su una ruota. Ordina per quanti
-    dei miei numeri la regola indica (anche uno solo conta)."""
     sub = ingestion.matrice_ruota(df, ruota_code) if ruota_code else None
     if sub is None or len(sub) < 50:
         return []
@@ -158,31 +242,10 @@ def affinita_regole(df, ruota_code, miei, data, top=8):
     return righe[:top]
 
 
-def carica_osservati():
-    if not os.path.exists(PERCORSO_OSS):
-        return []
-    try:
-        with open(PERCORSO_OSS, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return []
-
-
-def salva_osservati(voci):
-    with open(PERCORSO_OSS, "w", encoding="utf-8") as fh:
-        json.dump(voci, fh, ensure_ascii=False, indent=2)
-
-
 def misura_osservato(df, ruota_code, numeri, da_data):
-    """Scorre le estrazioni dalla data di inserimento in poi e registra ogni
-    volta che escono numeri della serie. Ritorna (n_controllate, lista_uscite)."""
     numeri = set(numeri)
-    if ruota_code == "TUTTE":
-        ruote = RUOTE
-    else:
-        ruote = [ruota_code]
-    uscite = []
-    n_contr = 0
+    ruote = RUOTE if ruota_code == "TUTTE" else [ruota_code]
+    uscite, n_contr = [], 0
     for rc in ruote:
         sub = ingestion.matrice_ruota(df, rc)
         sub = sub[sub["data"].dt.date >= da_data].sort_values("data")
@@ -195,46 +258,7 @@ def misura_osservato(df, ruota_code, numeri, da_data):
     return n_contr, uscite
 
 
-# ============================ intestazione + sidebar ============================
-
-st.markdown("<div class='hero'>🎱 SmartLotto</div>"
-            "<div class='hero-sub'>Analisi delle estrazioni del Lotto — con verifica onesta sui dati</div>",
-            unsafe_allow_html=True)
-
-percorso = st.sidebar.text_input("Archivio estrazioni", PERCORSO_DEFAULT)
-st.sidebar.subheader("Aggiornamento")
-if st.sidebar.button("⬇️ Scarica estrazioni mancanti"):
-    with st.spinner("Scarico le estrazioni nuove..."):
-        try:
-            n = aggiornamento.aggiorna_archivio(percorso)
-            carica.clear()
-            try:
-                tracker.verifica_previsioni(PERCORSO_PREV, carica(percorso))
-            except Exception:
-                pass
-            st.sidebar.success(f"{n} nuove estrazioni aggiunte." if n else "Archivio già aggiornato.")
-        except Exception as e:
-            st.sidebar.error(f"Aggiornamento non riuscito: {e}")
-ult = aggiornamento.ultima_data_archivio(percorso)
-if ult:
-    st.sidebar.caption(f"Ultima estrazione: {ult.strftime('%d/%m/%Y')}")
-
-if "auto_agg" not in st.session_state:
-    try:
-        aggiornamento.aggiorna_archivio(percorso)
-    except Exception:
-        pass
-    st.session_state["auto_agg"] = True
-
-try:
-    df = carica(percorso)
-except Exception as e:
-    st.error(f"Impossibile caricare l'archivio: {e}")
-    st.stop()
-
-
 def selezione_regole(prefix: str) -> list:
-    """Scelta delle regole con checkbox e pulsanti Tutte/Nessuna. Ritorna le chiavi scelte."""
     cat_map = regole.regole_per_categoria()
     for cat, elenco in cat_map.items():
         for chiave, _ in elenco:
@@ -256,6 +280,52 @@ def selezione_regole(prefix: str) -> list:
                 if st.checkbox(nome, key=f"{prefix}{chiave}"):
                     scelte.append(chiave)
     return scelte
+
+
+# ============================ intestazione + sidebar ============================
+
+st.markdown("<div class='hero'>🎱 SmartLotto</div>"
+            "<div class='hero-sub'>Analisi delle estrazioni del Lotto — con verifica onesta sui dati</div>",
+            unsafe_allow_html=True)
+
+percorso = st.sidebar.text_input("Archivio estrazioni", PERCORSO_DEFAULT)
+st.sidebar.subheader("Aggiornamento")
+if st.sidebar.button("⬇️ Scarica estrazioni mancanti"):
+    with st.spinner("Scarico le estrazioni nuove..."):
+        try:
+            n = aggiornamento.aggiorna_archivio(percorso)
+            carica.clear()
+            try:
+                verifica_previsioni(carica(percorso))
+            except Exception:
+                pass
+            st.sidebar.success(f"{n} nuove estrazioni aggiunte." if n else "Archivio già aggiornato.")
+        except Exception as e:
+            st.sidebar.error(f"Aggiornamento non riuscito: {e}")
+ult = aggiornamento.ultima_data_archivio(percorso)
+if ult:
+    st.sidebar.caption(f"Ultima estrazione: {ult.strftime('%d/%m/%Y')}")
+st.sidebar.caption("💾 I tuoi dati (numeri, osservati, previsioni) restano salvati "
+                   "nel browser di questo telefono, anche dopo gli aggiornamenti.")
+
+if "auto_agg" not in st.session_state:
+    try:
+        aggiornamento.aggiorna_archivio(percorso)
+    except Exception:
+        pass
+    st.session_state["auto_agg"] = True
+
+try:
+    df = carica(percorso)
+except Exception as e:
+    st.error(f"Impossibile caricare l'archivio: {e}")
+    st.stop()
+
+# Verifica automatica delle previsioni in sospeso a ogni apertura.
+try:
+    verifica_previsioni(df)
+except Exception:
+    pass
 
 
 tab_prev, tab_oss, tab_num, tab_guida, tab_cielo, tab_form = st.tabs(
@@ -288,14 +358,14 @@ with tab_prev:
             sub = ingestion.matrice_ruota(df, r)
             if len(sub) < 50:
                 continue
-            nums = predittore.cinquina_da_regole(sub, d_prev, chiavi or None)
-            risultati[RUOTE_NOMI[r]] = nums
+            risultati[RUOTE_NOMI[r]] = predittore.cinquina_da_regole(sub, d_prev, chiavi or None)
         st.session_state["pv_risultati"] = risultati
         st.session_state["pv_data"] = d_prev.isoformat()
 
     risultati = st.session_state.get("pv_risultati")
     if risultati:
-        st.markdown(f"**Numeri generati per il {_dt.date.fromisoformat(st.session_state['pv_data']).strftime('%d/%m/%Y')}**")
+        d_txt = _dt.date.fromisoformat(st.session_state["pv_data"]).strftime("%d/%m/%Y")
+        st.markdown(f"**Numeri generati per il {d_txt}**")
         for ruota, nums in risultati.items():
             st.markdown(f"<span class='ruota-lbl'>{ruota}</span> {chip_html(nums, big=True)}",
                         unsafe_allow_html=True)
@@ -304,18 +374,15 @@ with tab_prev:
         st.markdown("**🎟️ Se giochi questi 5 numeri — probabilità delle sorti**")
         st.dataframe(tabella_sorti(5), hide_index=True, use_container_width=True)
         st.caption("Le probabilità dipendono solo da quanti numeri giochi (5 su 90): "
-                   "sono uguali per qualsiasi cinquina. L'estratto (almeno un numero) "
-                   "capita in media 1 volta ogni ~4 estrazioni; il terno 1 su ~1.200.")
+                   "sono uguali per qualsiasi cinquina.")
 
         if st.button("💾 Salva questa previsione (per verificarla dopo)", use_container_width=True):
-            d_obj = _dt.date.fromisoformat(st.session_state["pv_data"])
-            tracker.registra_previsione(PERCORSO_PREV, d_obj, risultati)
-            st.success("Salvata. Dopo l'estrazione aggiorna l'archivio: i numeri usciti "
-                       "diventeranno verdi nella scheda Osservati.")
+            registra_previsione(_dt.date.fromisoformat(st.session_state["pv_data"]), risultati)
+            st.success("Salvata nel telefono. Dopo l'estrazione aggiorna l'archivio: "
+                       "i numeri usciti diventeranno verdi nella scheda Osservati.")
 
     st.warning("Onestà: questi numeri hanno la stessa probabilità di 5 numeri a caso. "
-               "Il criterio è trasparente, ma il backtesting (scheda Formule) mostra che "
-               "non batte il caso. Gioca con responsabilità.")
+               "Gioca con responsabilità.")
 
 
 # ============================ TAB OSSERVATI ============================
@@ -324,8 +391,7 @@ with tab_oss:
     st.caption("Salva una serie di numeri: l'app controlla a ogni estrazione futura "
                "se escono e dopo quante estrazioni. In verde i numeri realmente usciti.")
 
-    # --- verifica dell'ultima previsione salvata in Previsione ---
-    verif = tracker.ultima_verificata(PERCORSO_PREV)
+    verif = ultima_verificata()
     if verif:
         d = _dt.date.fromisoformat(verif["data_estrazione"]).strftime("%d/%m/%Y")
         tot = sum(e["n_azzeccati"] for e in verif["esiti"].values())
@@ -353,7 +419,7 @@ with tab_oss:
             voci = carica_osservati()
             voci.append({"id": _dt.datetime.now().strftime("%Y%m%d%H%M%S"),
                          "numeri": nums, "ruota": ruota_oss, "da": da_data.isoformat()})
-            salva_osservati(voci)
+            salva_osservati(voci, "oss_add")
             st.success(f"Aggiunta: {' '.join(f'{n:02d}' for n in nums)}")
         else:
             st.warning("Inserisci numeri validi (1-90).")
@@ -362,31 +428,29 @@ with tab_oss:
     voci = carica_osservati()
     if not voci:
         st.info("Nessuna serie in osservazione. Aggiungine una qui sopra.")
+    sorte_nomi = {1: "estratto", 2: "ambo", 3: "terno", 4: "quaterna", 5: "cinquina"}
     for v in reversed(voci):
         rn = "Tutte le ruote" if v["ruota"] == "TUTTE" else RUOTE_NOMI[v["ruota"]]
         da = _dt.date.fromisoformat(v["da"])
         n_contr, uscite = misura_osservato(df, v["ruota"], v["numeri"], da)
         tutti_usciti = sorted({n for u in uscite for n in u["azzeccati"]})
         best = max((u["n"] for u in uscite), default=0)
-        sorte_nomi = {1: "estratto", 2: "ambo", 3: "terno", 4: "quaterna", 5: "cinquina"}
         with st.container(border=True):
             st.markdown(f"<span class='ruota-lbl'>{rn}</span> {chip_html(v['numeri'], tutti_usciti)}",
                         unsafe_allow_html=True)
-            riepilogo = (f"Dal {da.strftime('%d/%m/%Y')} · {n_contr} estrazioni controllate · "
-                         f"{len(uscite)} volte con almeno un numero")
+            riep = (f"Dal {da.strftime('%d/%m/%Y')} · {n_contr} estrazioni controllate · "
+                    f"{len(uscite)} volte con almeno un numero")
             if best >= 2:
-                riepilogo += f" · **miglior colpo: {sorte_nomi.get(min(best,5))}**"
-            st.caption(riepilogo)
-            if uscite:
-                ult3 = uscite[-3:]
-                for u in reversed(ult3):
-                    st.markdown(f"<div style='font-size:.85rem;color:#4CBF8B'>"
-                                f"{u['data'].strftime('%d/%m/%Y')} ({u['ruota']}): "
-                                f"{' '.join(f'{n:02d}' for n in u['azzeccati'])} "
-                                f"— {sorte_nomi.get(min(u['n'],5))}, dopo {u['dopo']} estrazioni</div>",
-                                unsafe_allow_html=True)
+                riep += f" · **miglior colpo: {sorte_nomi.get(min(best,5))}**"
+            st.caption(riep)
+            for u in reversed(uscite[-3:]):
+                st.markdown(f"<div style='font-size:.85rem;color:#4CBF8B'>"
+                            f"{u['data'].strftime('%d/%m/%Y')} ({u['ruota']}): "
+                            f"{' '.join(f'{n:02d}' for n in u['azzeccati'])} "
+                            f"— {sorte_nomi.get(min(u['n'],5))}, dopo {u['dopo']} estrazioni</div>",
+                            unsafe_allow_html=True)
             if st.button("🗑️ Rimuovi", key="del_" + v["id"]):
-                salva_osservati([x for x in carica_osservati() if x["id"] != v["id"]])
+                salva_osservati([x for x in carica_osservati() if x["id"] != v["id"]], "oss_del")
                 st.rerun()
 
 
@@ -416,7 +480,10 @@ with tab_num:
 
     st.markdown("---")
     st.subheader("🎟️ I miei numeri")
-    testo = st.text_input("Da 1 a 5 numeri separati da spazio", "7 25 45 67 82", key="num_miei")
+    miei_saved = ls_load("sl_miei", "7 25 45 67 82")
+    testo = st.text_input("Da 1 a 5 numeri separati da spazio", miei_saved, key="num_miei")
+    if testo.strip() != str(miei_saved).strip():
+        ls_save("sl_miei", testo.strip(), "miei_save")
     try:
         miei = sorted({int(x) for x in testo.split() if 1 <= int(x) <= 90})[:5]
     except ValueError:
@@ -432,8 +499,7 @@ with tab_num:
         st.markdown("**Quante volte sono usciti, ruota per ruota (%)**")
         ftab = frequenze_per_ruota(percorso)
         st.bar_chart(ftab.loc[miei].T, height=280)
-        st.caption("Ogni serie è uno dei tuoi numeri. Le altezze si equivalgono: "
-                   "nessuna ruota è più generosa.")
+        st.caption("Ogni serie è uno dei tuoi numeri. Le altezze si equivalgono.")
 
         st.markdown(f"**🔗 Regole più affini ai tuoi numeri — ruota di {RUOTE_NOMI[ruota]}**")
         aff = affinita_regole(df, ruota, miei, tracker.prossimo_giorno_estrazione(df["data"].max().date()))
@@ -442,9 +508,8 @@ with tab_num:
                 {"regola": nome, "tuoi numeri che indica": " ".join(f"{n:02d}" for n in inter),
                  "quanti indica in tutto": tot} for nome, inter, tot in aff]),
                 hide_index=True, use_container_width=True)
-            st.caption("Sono le regole che, applicate a questa ruota, propongono i numeri "
-                       "che hai scelto. 'Affine' non vuol dire 'più probabile': è solo il "
-                       "criterio che ti ha portato a quei numeri.")
+            st.caption("Sono le regole che, su questa ruota, propongono i numeri che hai scelto. "
+                       "'Affine' non vuol dire 'più probabile'.")
         else:
             st.info("Nessuna regola propone questi numeri su questa ruota.")
 
@@ -452,10 +517,8 @@ with tab_num:
 # ============================ TAB GUIDA ============================
 with tab_guida:
     st.subheader("📖 Come leggere le percentuali")
-    st.markdown("""
-Una **percentuale** dice quanto è probabile una cosa, su una scala da **0% (mai)**
-a **100% (sempre, certo)**. Il famoso **5,5%** del Lotto **non** vuol dire "esce di sicuro".
-""")
+    st.markdown("Una **percentuale** dice quanto è probabile una cosa, da **0% (mai)** a "
+                "**100% (sempre)**. Il **5,5%** del Lotto **non** vuol dire «esce di sicuro».")
     st.markdown("**Ogni percentuale è un «1 volta su quanti»**")
     st.table(pd.DataFrame([
         {"Percentuale": "100%", "Vuol dire": "esce sempre, è certo", "1 volta su…": "1"},
@@ -466,19 +529,13 @@ a **100% (sempre, certo)**. Il famoso **5,5%** del Lotto **non** vuol dire "esce
         {"Percentuale": "0,25%", "Vuol dire": "l'ambo (2 numeri giusti)", "1 volta su…": "400"},
         {"Percentuale": "0%", "Vuol dire": "impossibile", "1 volta su…": "—"},
     ]))
-    st.info("**5,5% = su 90 palline ne escono 5.** Il tuo numero è una casella qualsiasi: "
-            "ha 5 possibilità su 90. Non dipende da quanto è in ritardo o da quale regola scegli.")
-    st.markdown("**Più piccola è la percentuale, più raro è l'evento** — e più devi aspettare. "
-                "Quindi sì: 2,5% è meno probabile di 5,5%.")
-
+    st.info("**5,5% = su 90 palline ne escono 5.** Non dipende da quanto un numero è in "
+            "ritardo o da quale regola scegli.")
     st.markdown("---")
     st.subheader("🚦 Affidabilità: quando un numero è «verde»?")
-    st.markdown("""
-L'app misura ogni criterio su **oltre 150 anni** di estrazioni. Un numero o una regola
-diventa **verde** solo se batte il caso in modo solido e ripetuto — non è mai successo
-finora. Se vedi tutto **neutro/grigio**, è la verità: quei numeri valgono come numeri a caso.
-Meglio saperlo che illudersi.
-""")
+    st.markdown("L'app misura ogni criterio su oltre 150 anni di estrazioni. Un numero diventa "
+                "**verde** solo se batte il caso in modo solido — non è mai successo finora. "
+                "Se vedi tutto neutro, è la verità: valgono come numeri a caso.")
 
 
 # ============================ TAB CIELO ============================
@@ -509,14 +566,9 @@ with tab_cielo:
 # ============================ TAB FORMULE ============================
 with tab_form:
     st.subheader("🔬 La prova sui dati")
-    st.markdown("""
-Qui l'app **si mette alla prova con onestà**. Due strumenti:
-""")
-
     st.markdown("### 1) Backtesting delle regole")
-    st.caption("Ogni regola viene provata «all'epoca»: usa solo le estrazioni precedenti "
-               "e avanza nel tempo, dalle prime estrazioni a oggi. Deve battere la giocata "
-               f"a caso ({P_ESTRATTO*100:.3f}%).")
+    st.caption("Ogni regola viene provata «all'epoca»: usa solo le estrazioni precedenti e "
+               f"avanza nel tempo. Deve battere la giocata a caso ({P_ESTRATTO*100:.3f}%).")
     warmup = st.slider("Estrazioni iniziali di rodaggio", 100, 1000, 300, 100)
     st.markdown("**Scegli le regole da provare**")
     chiavi_bt = selezione_regole("bt_")
@@ -527,27 +579,19 @@ Qui l'app **si mette alla prova con onestà**. Due strumenti:
         for n, r in sorted(res.items(), key=lambda kv: kv[1]["z"], reverse=True):
             nome = regole.PER_CHIAVE.get(n, (n, n))[1]
             diff = (r["tasso"] - P_ESTRATTO) * 100
-            righe.append({
-                "regola": nome,
-                "riuscita": f"{r['tasso']*100:.2f}%",
-                "vs caso": f"{diff:+.2f}%",
-                "esito": "🟢 batte il caso" if r["p_value"] < 0.001 and diff > 0 else "⚪ come il caso",
-            })
+            righe.append({"regola": nome, "riuscita": f"{r['tasso']*100:.2f}%",
+                          "vs caso": f"{diff:+.2f}%",
+                          "esito": "🟢 batte il caso" if r["p_value"] < 0.001 and diff > 0 else "⚪ come il caso"})
         st.dataframe(pd.DataFrame(righe), hide_index=True, use_container_width=True)
-        st.success("Nessuna regola resta 🟢: tutte vanno «come il caso». "
-                   "È il risultato atteso — le estrazioni sono indipendenti.")
+        st.success("Nessuna regola resta 🟢: tutte vanno «come il caso». È il risultato atteso.")
 
     st.markdown("---")
     st.markdown("### 2) Analizza una serie di numeri sul futuro")
-    st.markdown("""
-**A cosa serve la data di separazione?** Divide la storia in due:
-il **passato** serve a scegliere/valutare i numeri, il **futuro** (dopo quella data) serve
-a controllare se davvero continuano a uscire di più. Se un numero è «bravo» solo nel
-passato ma non nel futuro, era solo fortuna (si chiama *overfitting*).
-""")
+    st.markdown("**A cosa serve la data di separazione?** Divide la storia in due: il **passato** "
+                "serve a scegliere i numeri, il **futuro** (dopo quella data) serve a controllare "
+                "se davvero continuano a uscire di più. Se sono bravi solo nel passato, era fortuna.")
     miei_def = " ".join(f"{n:02d}" for n in st.session_state.get("miei_numeri", [7, 25, 45, 67, 82]))
-    serie_txt = st.text_input("Numeri da analizzare (li trovi anche nella scheda Numeri)",
-                              miei_def, key="form_serie")
+    serie_txt = st.text_input("Numeri da analizzare", miei_def, key="form_serie")
     taglio = st.date_input("Data di separazione passato / futuro", dt.date(2010, 1, 1),
                            key="form_taglio", format="DD/MM/YYYY")
     if st.button("🔎 Analizza questi numeri", use_container_width=True):
@@ -559,17 +603,15 @@ passato ma non nel futuro, era solo fortuna (si chiama *overfitting*).
             st.warning("Inserisci numeri validi (1-90).")
         else:
             tcut = pd.Timestamp(taglio)
-            df_in = df[df["data"] < tcut]
-            df_out = df[df["data"] >= tcut]
+            df_in, df_out = df[df["data"] < tcut], df[df["data"] >= tcut]
 
             def tasso(dd):
                 if len(dd) == 0:
                     return None
                 usc = sum(1 for s in dd["numeri"] for n in serie if n in s)
-                return usc / (len(dd) * 5)  # per posizione estratta
+                return usc / (len(dd) * 5)
 
-            t_in, t_out = tasso(df_in), tasso(df_out)
-            base = P_ESTRATTO
+            t_in, t_out, base = tasso(df_in), tasso(df_out), P_ESTRATTO
             st.markdown(f"**Numeri analizzati:** {' '.join(f'{n:02d}' for n in serie)}")
             c1, c2, c3 = st.columns(3)
             c1.metric("Nel passato", f"{t_in*100:.2f}%" if t_in else "—",
@@ -581,7 +623,7 @@ passato ma non nel futuro, era solo fortuna (si chiama *overfitting*).
                 verde = t_out > base * 1.05
                 st.markdown(f"### {'🟢 Regge anche nel futuro' if verde else '⚪ Come il caso'}")
                 st.caption("Se il valore «nel futuro» non supera stabilmente quello del caso, "
-                           "i numeri non hanno alcun vantaggio reale — qualunque cosa dica il passato.")
+                           "i numeri non hanno alcun vantaggio reale.")
 
     st.markdown("---")
     with st.expander("Vedi la prova su 900 regole (dimostrazione overfitting)"):
@@ -593,6 +635,5 @@ passato ma non nel futuro, era solo fortuna (si chiama *overfitting*).
             c2.metric("Sembravano buone (passato)", ff["significative_p05"],
                       help=f"Attese per puro caso: ~{ff['attesi_falsi_positivi_p05']:.0f}")
             c3.metric("Legame passato→futuro", f"{ff['correlazione_in_out']:.3f}")
-            st.warning("Le regole 'migliori' nel passato non reggono nel futuro. "
-                       "Cercando tante regole se ne trova sempre qualcuna buona per caso, "
-                       "ma il caso non si ripete: il legame passato→futuro è praticamente zero.")
+            st.warning("Le regole 'migliori' nel passato non reggono nel futuro: il legame "
+                       "passato→futuro è praticamente zero.")
