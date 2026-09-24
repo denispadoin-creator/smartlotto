@@ -13,6 +13,9 @@ from __future__ import annotations
 import datetime as dt
 import datetime as _dt
 import json
+import time
+from collections import Counter
+from itertools import combinations
 from math import comb
 
 import numpy as np
@@ -52,6 +55,13 @@ try:
     LS = LocalStorage()
 except Exception:
     LS = None
+
+
+def rerun_dopo_salvataggio():
+    """Dà tempo al browser di scrivere nel localStorage PRIMA di ricaricare,
+    altrimenti il salvataggio può andare perso (limite del componente)."""
+    time.sleep(0.6)
+    st.rerun()
 
 
 def ls_load(chiave, default):
@@ -220,6 +230,20 @@ def esegui_backtest(percorso: str, warmup: int, chiavi: tuple) -> dict:
 def esegui_formule(percorso: str, taglio: str) -> dict:
     df = carica(percorso)
     return formule.cerca_formule(df, taglio, top=10)
+
+
+@st.cache_data(show_spinner="Calcolo i più ricorrenti...")
+def ricorrenti(percorso: str, ruota_code: str):
+    """Estratti, ambi e terni più usciti dalla prima estrazione a oggi."""
+    df = carica(percorso)
+    sub = df if ruota_code == "TUTTE" else df[df["ruota"] == ruota_code]
+    est, amb, ter = Counter(), Counter(), Counter()
+    for numeri in sub["numeri"]:
+        ns = sorted(int(x) for x in numeri)
+        est.update(ns)
+        amb.update(combinations(ns, 2))
+        ter.update(combinations(ns, 3))
+    return est.most_common(15), amb.most_common(15), ter.most_common(15)
 
 
 def prob_sorte(k: int, s: int) -> float:
@@ -433,9 +457,41 @@ except Exception:
     pass
 
 
-tab_sched, tab_prev, tab_oss, tab_num, tab_agente, tab_guida, tab_cielo, tab_form = st.tabs(
-    ["🎟️ Schedina", "🎯 Previsione", "👁️ Osservati", "📊 Numeri", "🤖 Agente",
-     "📖 Guida", "🌙 Cielo", "🔬 Formule"])
+tab_sched, tab_ult, tab_prev, tab_oss, tab_num, tab_agente, tab_guida, tab_cielo, tab_form = st.tabs(
+    ["🎟️ Schedina", "🎰 Ultima & Ricorrenti", "🎯 Previsione", "👁️ Osservati", "📊 Numeri",
+     "🤖 Agente", "📖 Guida", "🌙 Cielo", "🔬 Formule"])
+
+
+# ============================ TAB ULTIMA & RICORRENTI ============================
+with tab_ult:
+    st.subheader("🎰 Ultima estrazione")
+    ultima_data = df["data"].max().date()
+    st.markdown(f"**{ultima_data.strftime('%d/%m/%Y')}** — tutte le ruote")
+    ult_df = df[df["data"].dt.date == ultima_data].sort_values("ruota")
+    for _, row in ult_df.iterrows():
+        nums = sorted(int(x) for x in row["numeri"])
+        st.markdown(f"<span class='ruota-lbl'>{RUOTE_NOMI[row['ruota']]}</span> {chip_html(nums)}",
+                    unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader("🔥 I più ricorrenti di sempre")
+    st.caption("Estratti, ambi e terni più usciti dalla prima estrazione (1871) a oggi.")
+    scelta = st.selectbox("Ruota", ["TUTTE"] + RUOTE,
+                          format_func=lambda r: "Tutte le ruote" if r == "TUTTE" else RUOTE_NOMI[r],
+                          key="ric_ruota")
+    est, amb, ter = ricorrenti(percorso, scelta)
+    st.markdown("**Estratti più usciti**")
+    st.dataframe(pd.DataFrame([{"numero": f"{n:02d}", "uscite": c} for n, c in est]),
+                 hide_index=True, use_container_width=True)
+    st.markdown("**Ambi più usciti**")
+    st.dataframe(pd.DataFrame([{"ambo": f"{a:02d} · {b:02d}", "uscite": c} for (a, b), c in amb]),
+                 hide_index=True, use_container_width=True)
+    st.markdown("**Terni più usciti**")
+    st.dataframe(pd.DataFrame([{"terno": f"{a:02d} · {b:02d} · {d:02d}", "uscite": c}
+                               for (a, b, d), c in ter]),
+                 hide_index=True, use_container_width=True)
+    st.caption("Nota onesta: i più usciti nel passato NON hanno più probabilità di uscire in "
+               "futuro. Ogni estrazione è indipendente. È una curiosità storica, non una previsione.")
 
 
 # ============================ TAB SCHEDINA ============================
@@ -479,7 +535,7 @@ with tab_sched:
                          "reale": bool(reale), "giocate": valide})
             salva_schedine(voci, "sched_add")
             st.success("Schedina salvata e messa in monitoraggio.")
-            st.rerun()
+            rerun_dopo_salvataggio()
 
     st.markdown("---")
     st.subheader("Le mie schedine")
@@ -519,10 +575,10 @@ with tab_sched:
                     if x["id"] == v["id"]:
                         x["reale"] = not x.get("reale")
                 salva_schedine(voci2, "sched_tg")
-                st.rerun()
+                rerun_dopo_salvataggio()
             if cbtn[1].button("🗑️ Rimuovi", key="rm_" + v["id"]):
                 salva_schedine([x for x in carica_schedine() if x["id"] != v["id"]], "sched_rm")
-                st.rerun()
+                rerun_dopo_salvataggio()
 
 
 # ============================ TAB AGENTE ============================
@@ -540,7 +596,7 @@ with tab_agente:
                 if nuove:
                     _applica_nuove(nuove)
                     st.success(f"Scaricate {len(nuove)} nuove estrazioni.")
-                    st.rerun()
+                    rerun_dopo_salvataggio()
                 else:
                     st.info("Archivio già aggiornato.")
             except Exception as e:
@@ -560,7 +616,7 @@ with tab_agente:
             riga = f"{md.year:04d}{md.month:02d}{md.day:02d} {mr}:" + ".".join(f"{x:02d}" for x in nn)
             _applica_nuove([riga])
             st.success(f"Aggiunta {RUOTE_NOMI[mr]} del {md.strftime('%d/%m/%Y')}.")
-            st.rerun()
+            rerun_dopo_salvataggio()
         else:
             st.warning("Servono esattamente 5 numeri fra 1 e 90.")
     st.caption("💾 Le estrazioni scaricate o inserite restano nel browser di questo telefono.")
@@ -685,7 +741,7 @@ with tab_oss:
                             unsafe_allow_html=True)
             if st.button("🗑️ Rimuovi", key="del_" + v["id"]):
                 salva_osservati([x for x in carica_osservati() if x["id"] != v["id"]], "oss_del")
-                st.rerun()
+                rerun_dopo_salvataggio()
 
 
 # ============================ TAB NUMERI ============================
