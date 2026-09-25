@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import datetime as _dt
 import json
+import re
 import time
 from collections import Counter
 from itertools import combinations
@@ -246,6 +247,97 @@ def ricorrenti(percorso: str, ruota_code: str):
     return est.most_common(15), amb.most_common(15), ter.most_common(15)
 
 
+def _ruota_da_testo(q):
+    for code, nome in RUOTE_NOMI.items():
+        if nome.lower() in q:
+            return code
+    return None
+
+
+def assistente_rispondi(q, df, percorso):
+    """Risponde a domande in italiano leggendo l'archivio. Nessuna AI a pagamento."""
+    q = (q or "").lower().strip()
+    if not q:
+        return None
+    rc = _ruota_da_testo(q)
+    nums = sorted({int(x) for x in re.findall(r"\d{1,2}", q) if 1 <= int(x) <= 90})
+    ruote = [rc] if rc else RUOTE
+    R = []
+
+    # ultima estrazione
+    if "ultima" in q or ("estrazione" in q and "ricorr" not in q):
+        d = df["data"].max().date()
+        R.append(f"**Ultima estrazione — {d.strftime('%d/%m/%Y')}**")
+        ult = df[df["data"].dt.date == d]
+        for r in ruote:
+            row = ult[ult["ruota"] == r]
+            if not row.empty:
+                ns = sorted(int(x) for x in row.iloc[0]["numeri"])
+                R.append(f"- {RUOTE_NOMI[r]}: " + "  ".join(f"{n:02d}" for n in ns))
+        return "\n".join(R)
+
+    # da quanto manca un numero
+    if nums and ("ritard" in q or "manca" in q):
+        n = nums[0]
+        R.append(f"**Da quanto manca il {n:02d}**")
+        for r in ruote:
+            P = ingestion.matrice_presenza(ingestion.matrice_ruota(df, r))
+            col = P[:, n]
+            rit = (P.shape[0] - 1 - int(np.nonzero(col)[0].max())) if col.any() else P.shape[0]
+            R.append(f"- {RUOTE_NOMI[r]}: {rit} estrazioni fa")
+        return "\n".join(R)
+
+    # quante volte è uscito un numero
+    if nums and ("quante" in q or "uscito" in q or "frequenza" in q):
+        n = nums[0]
+        R.append(f"**Quante volte è uscito il {n:02d}**")
+        for r in ruote:
+            P = ingestion.matrice_presenza(ingestion.matrice_ruota(df, r))
+            R.append(f"- {RUOTE_NOMI[r]}: {int(P[:, n].sum())} volte su {P.shape[0]}")
+        return "\n".join(R)
+
+    # ambi / terni più usciti
+    if any(w in q for w in ["ambo", "ambi", "terno", "terni"]):
+        _, amb, ter = ricorrenti(percorso, rc if rc else "TUTTE")
+        dove = RUOTE_NOMI[rc] if rc else "tutte le ruote"
+        if "tern" in q:
+            R.append(f"**Terni più usciti — {dove}**")
+            R += [f"- {a:02d} · {b:02d} · {c:02d}  ({n} volte)" for (a, b, c), n in ter[:8]]
+        else:
+            R.append(f"**Ambi più usciti — {dove}**")
+            R += [f"- {a:02d} · {b:02d}  ({n} volte)" for (a, b), n in amb[:8]]
+        return "\n".join(R)
+
+    # ritardatari
+    if "ritard" in q:
+        if rc:
+            top = statistiche.classifica_ritardatari(
+                ingestion.matrice_presenza(ingestion.matrice_ruota(df, rc)), top=10)
+            R.append(f"**Più ritardatari — {RUOTE_NOMI[rc]}**")
+            R.append(", ".join(f"{n:02d} ({rit})" for n, rit in top))
+        else:
+            R.append("**Il numero più ritardatario per ogni ruota**")
+            for r in RUOTE:
+                n, rit = statistiche.classifica_ritardatari(
+                    ingestion.matrice_presenza(ingestion.matrice_ruota(df, r)), top=1)[0]
+                R.append(f"- {RUOTE_NOMI[r]}: {n:02d} (da {rit})")
+        return "\n".join(R)
+
+    # caldi / freddi
+    if any(w in q for w in ["cald", "frequ", "spesso", "fredd", "raro", "rari", "meno"]):
+        caldi = not any(w in q for w in ["fredd", "raro", "rari", "meno"])
+        R.append(("**Numeri più frequenti (caldi)**" if caldi else "**Numeri meno usciti (freddi)**")
+                 + (f" — {RUOTE_NOMI[rc]}" if rc else ""))
+        for r in ruote:
+            top = statistiche.classifica_frequenti(
+                ingestion.matrice_presenza(ingestion.matrice_ruota(df, r)),
+                top=(10 if rc else 3), caldi=caldi)
+            R.append(("" if rc else f"{RUOTE_NOMI[r]}: ") + ", ".join(f"{n:02d}" for n, _ in top))
+        return "\n".join(R)
+
+    return None
+
+
 def prob_sorte(k: int, s: int) -> float:
     tot = comb(90, 5)
     fav = sum(comb(k, i) * comb(90 - k, 5 - i) for i in range(s, min(k, 5) + 1))
@@ -446,7 +538,7 @@ if "auto_agg" not in st.session_state:
 # Banner dell'agente, ben visibile in cima (i comandi sono nella scheda 🤖 Agente)
 _m = st.session_state.get("agg_msg")
 if _m:
-    (st.info if _m[0] == "ok" else st.warning)(_m[1] + "  ·  Comandi nella scheda 🤖 Agente.")
+    (st.info if _m[0] == "ok" else st.warning)(_m[1] + "  ·  Comandi nella scheda 🔄 Aggiornamento.")
 st.sidebar.caption("💾 I tuoi dati (numeri, osservati, schedine, estrazioni) restano nel "
                    "browser di questo telefono, anche dopo gli aggiornamenti.")
 
@@ -457,9 +549,87 @@ except Exception:
     pass
 
 
-tab_sched, tab_ult, tab_prev, tab_oss, tab_num, tab_agente, tab_guida, tab_cielo, tab_form = st.tabs(
-    ["🎟️ Schedina", "🎰 Ultima & Ricorrenti", "🎯 Previsione", "👁️ Osservati", "📊 Numeri",
-     "🤖 Agente", "📖 Guida", "🌙 Cielo", "🔬 Formule"])
+(tab_sched, tab_ver, tab_ult, tab_ass, tab_prev, tab_oss, tab_num, tab_agente,
+ tab_guida, tab_cielo, tab_form) = st.tabs(
+    ["🎟️ Schedina", "✅ Verifica", "🎰 Ultima & Ricorrenti", "💬 Assistente", "🎯 Previsione",
+     "👁️ Osservati", "📊 Numeri", "🔄 Aggiornamento", "📖 Guida", "🌙 Cielo", "🔬 Formule"])
+
+
+# ============================ TAB VERIFICA ============================
+with tab_ver:
+    st.subheader("✅ Verifica una giocata")
+    st.caption("Scrivi la DATA dell'estrazione, la ruota, i numeri giocati e quanto hai puntato: "
+               "l'app controlla quell'estrazione e ti dice se hai vinto e quanto.")
+    vd = st.date_input("Data dell'estrazione da controllare", df["data"].max().date(),
+                       key="ver_data", format="DD/MM/YYYY")
+    vr = st.selectbox("Ruota", RUOTE, format_func=lambda r: RUOTE_NOMI[r], key="ver_ruota")
+    vt = st.text_input("Numeri giocati (da 1 a 10, separati da spazio)", key="ver_num",
+                       placeholder="es. 5 17 23 44 67 82")
+    st.markdown("**Quanto hai puntato per sorte (€)**")
+    vcols = st.columns(5)
+    vpunti = {}
+    for vcol, s in zip(vcols, ["estratto", "ambo", "terno", "quaterna", "cinquina"]):
+        vpunti[s] = vcol.number_input(s.capitalize(), 0.0, 200.0, 0.0, 0.5, key=f"ver_{s}")
+
+    if st.button("✅ Verifica vincita", type="primary", use_container_width=True):
+        try:
+            vnums = sorted({int(x) for x in vt.split() if 1 <= int(x) <= 90})[:10]
+        except ValueError:
+            vnums = []
+        if not vnums:
+            st.warning("Scrivi i numeri giocati (da 1 a 90).")
+        else:
+            giorno = df[(df["data"].dt.date == vd) & (df["ruota"] == vr)]
+            if giorno.empty:
+                st.error(f"Non ho l'estrazione del {vd.strftime('%d/%m/%Y')} su {RUOTE_NOMI[vr]} "
+                         "in archivio. Controlla la data, o aggiorna l'archivio "
+                         "(scheda 🔄 Aggiornamento).")
+            else:
+                estratti = sorted(int(x) for x in giorno.iloc[0]["numeri"])
+                usciti = sorted(set(vnums) & set(estratti))
+                st.markdown(f"**Estrazione del {vd.strftime('%d/%m/%Y')} — {RUOTE_NOMI[vr]}**")
+                st.markdown("Numeri estratti: " + chip_html(estratti), unsafe_allow_html=True)
+                st.markdown("I tuoi numeri: " + chip_html(vnums, usciti, big=True),
+                            unsafe_allow_html=True)
+                det, tot = vincita_giocata(vnums, vpunti, len(usciti))
+                azz = " ".join(f"{n:02d}" for n in usciti) or "nessuno"
+                if tot > 0:
+                    st.markdown(f"### 🎉 Hai vinto {tot:.2f} €")
+                    for s, val in det.items():
+                        if val > 0:
+                            st.markdown(f"- {s.capitalize()}: {val:.2f} €")
+                    st.caption(f"Numeri azzeccati: {len(usciti)} ({azz}). Importo lordo, "
+                               "prima della tassa dello Stato.")
+                elif not any(float(x or 0) > 0 for x in vpunti.values()):
+                    st.info(f"Hai azzeccato {len(usciti)} numeri ({azz}), ma non hai indicato "
+                            "nessuna puntata. Metti almeno una puntata (ambo, terno...) per "
+                            "calcolare la vincita.")
+                else:
+                    st.warning(f"Nessuna vincita. Numeri azzeccati: {len(usciti)} ({azz}) — "
+                               "non bastano per le sorti che hai puntato.")
+
+
+# ============================ TAB ASSISTENTE ============================
+with tab_ass:
+    st.subheader("💬 Assistente — scrivi una domanda")
+    st.caption("Scrivi qui la tua domanda: l'app risponde leggendo tutto l'archivio storico. "
+               "Gratis, funziona sempre.")
+    dom = st.text_input("La tua domanda", key="ass_dom", placeholder="es. ritardatari di Bari")
+    with st.expander("👀 Esempi di domande che capisce"):
+        st.markdown("- **ritardatari di Bari**\n- **numeri caldi Napoli**\n- **numeri freddi Roma**\n"
+                    "- **da quanto manca il 90 su Milano**\n- **quante volte è uscito il 7 a Venezia**\n"
+                    "- **ultima estrazione**\n- **ambi più usciti Cagliari**\n- **terni più usciti**")
+    if dom.strip():
+        try:
+            risposta = assistente_rispondi(dom, df, percorso)
+        except Exception:
+            risposta = None
+        if risposta:
+            st.markdown(risposta)
+        else:
+            st.info("Non ho capito. Prova con: ritardatari [ruota] · caldi [ruota] · freddi [ruota] · "
+                    "da quanto manca il N su [ruota] · quante volte è uscito il N · "
+                    "ultima estrazione · ambi/terni più usciti [ruota].")
 
 
 # ============================ TAB ULTIMA & RICORRENTI ============================
@@ -480,16 +650,25 @@ with tab_ult:
                           format_func=lambda r: "Tutte le ruote" if r == "TUTTE" else RUOTE_NOMI[r],
                           key="ric_ruota")
     est, amb, ter = ricorrenti(percorso, scelta)
-    st.markdown("**Estratti più usciti**")
-    st.dataframe(pd.DataFrame([{"numero": f"{n:02d}", "uscite": c} for n, c in est]),
-                 hide_index=True, use_container_width=True)
-    st.markdown("**Ambi più usciti**")
-    st.dataframe(pd.DataFrame([{"ambo": f"{a:02d} · {b:02d}", "uscite": c} for (a, b), c in amb]),
-                 hide_index=True, use_container_width=True)
-    st.markdown("**Terni più usciti**")
-    st.dataframe(pd.DataFrame([{"terno": f"{a:02d} · {b:02d} · {d:02d}", "uscite": c}
-                               for (a, b, d), c in ter]),
-                 hide_index=True, use_container_width=True)
+    top5 = [n for n, _ in est[:5]]  # i 5 estratti più frequenti
+
+    st.markdown("**Estratti più usciti** — i primi 5 sono in verde")
+    st.markdown(chip_html([n for n, _ in est[:15]], top5), unsafe_allow_html=True)
+
+    st.info("In verde ci sono i 5 estratti più frequenti. Guarda sotto: spesso NON compaiono "
+            "negli ambi e terni più frequenti. Vuol dire che un numero che esce tanto da solo "
+            "non è detto che esca spesso IN COPPIA con un altro.")
+
+    def _riga_sorte(numeri, c):
+        return (f"<div style='margin:4px 0'>{chip_html(numeri, top5)}"
+                f"<span style='color:#AAB6C4;margin-left:8px'>{c} volte</span></div>")
+
+    st.markdown("**Ambi più usciti** (verde = numero fra i 5 estratti top)")
+    st.markdown("".join(_riga_sorte([a, b], c) for (a, b), c in amb), unsafe_allow_html=True)
+
+    st.markdown("**Terni più usciti** (verde = numero fra i 5 estratti top)")
+    st.markdown("".join(_riga_sorte([a, b, d], c) for (a, b, d), c in ter), unsafe_allow_html=True)
+
     st.caption("Nota onesta: i più usciti nel passato NON hanno più probabilità di uscire in "
                "futuro. Ogni estrazione è indipendente. È una curiosità storica, non una previsione.")
 
@@ -583,8 +762,9 @@ with tab_sched:
 
 # ============================ TAB AGENTE ============================
 with tab_agente:
-    st.subheader("🤖 Agente estrazioni")
-    st.caption("Scarica da solo le estrazioni nuove all'apertura e le salva nel telefono.")
+    st.subheader("🔄 Aggiornamento estrazioni")
+    st.caption("Scarica da solo le estrazioni nuove all'apertura e le salva nel telefono. "
+               "(Per fare DOMANDE usa invece la scheda 💬 Assistente.)")
     _mm = st.session_state.get("agg_msg")
     if _mm:
         (st.info if _mm[0] == "ok" else st.warning)(_mm[1])
